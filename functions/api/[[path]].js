@@ -28,6 +28,7 @@ async function init(db) {
     db.prepare("CREATE TABLE IF NOT EXISTS sessions(th TEXT PRIMARY KEY, k TEXT NOT NULL, created INTEGER, used INTEGER)"),
     db.prepare("CREATE TABLE IF NOT EXISTS data(k TEXT PRIMARY KEY, quiz TEXT, calc TEXT, calcTs INTEGER DEFAULT 0, updated INTEGER)"),
   ]);
+  try { await db.prepare("ALTER TABLE data ADD COLUMN act TEXT").run(); } catch { /* colonne déjà là */ }
   ready = true;
 }
 const isAdmin = (env, u) => !!env.ADMIN_PSEUDO && keyOf(String(env.ADMIN_PSEUDO).trim()) === u.k;
@@ -55,6 +56,25 @@ function mergeQuiz(a, b) {
     const x = r[id];
     if (!x || (y.n || 0) > (x.n || 0) || ((y.n || 0) === (x.n || 0) && (y.due || 0) > (x.due || 0))) r[id] = y;
     else if (y.fl !== undefined && x.fl === undefined) r[id] = { ...x, fl: y.fl };
+  }
+  return r;
+}
+// Activité par appareil : {appareil:{jour:{uv:[questions, bonnes, ms]}}}. Chaque appareil ne fait qu'augmenter ses compteurs : le maximum gagne.
+function mergeAct(a, b) {
+  const r = a && typeof a === "object" ? a : {};
+  if (!b || typeof b !== "object") return r;
+  for (const [dv, days] of Object.entries(b)) {
+    if (!days || typeof days !== "object" || dv.length > 24) continue;
+    const R = r[dv] = r[dv] || {};
+    for (const [d, uvs] of Object.entries(days)) {
+      if (!/^\d{4}-\d\d-\d\d$/.test(d) || !uvs || typeof uvs !== "object") continue;
+      const D = R[d] = R[d] || {};
+      for (const [u, v] of Object.entries(uvs)) {
+        if (!Array.isArray(v) || !/^\d{3}$/.test(u)) continue;
+        const x = D[u] || [0, 0, 0];
+        D[u] = [0, 1, 2].map(i => Math.max(+x[i] || 0, Math.min(Math.max(0, +v[i] || 0), i < 2 ? 1e5 : 864e5)));
+      }
+    }
   }
   return r;
 }
@@ -127,14 +147,15 @@ export async function onRequest({ request: req, env, params }) {
   }
   if (path === "data" && (M === "PUT" || M === "GET")) {
     const row = await db.prepare("SELECT * FROM data WHERE k=?").bind(u.k).first();
-    let quiz = parse(row && row.quiz, {}), calc = row ? row.calc : null, calcTs = row ? row.calcTs || 0 : 0;
+    let quiz = parse(row && row.quiz, {}), act = parse(row && row.act, {}), calc = row ? row.calc : null, calcTs = row ? row.calcTs || 0 : 0;
     if (M === "PUT") {
       if (body.quiz && typeof body.quiz === "object") quiz = mergeQuiz(quiz, body.quiz);
+      if (body.act && typeof body.act === "object") act = mergeAct(act, body.act);
       if (typeof body.calc === "string" && (+body.calcTs || 0) > calcTs) { calc = body.calc; calcTs = +body.calcTs; }
-      await db.prepare("INSERT INTO data(k,quiz,calc,calcTs,updated) VALUES(?,?,?,?,?) ON CONFLICT(k) DO UPDATE SET quiz=excluded.quiz, calc=excluded.calc, calcTs=excluded.calcTs, updated=excluded.updated")
-        .bind(u.k, JSON.stringify(quiz), calc, calcTs, now).run();
+      await db.prepare("INSERT INTO data(k,quiz,act,calc,calcTs,updated) VALUES(?,?,?,?,?,?) ON CONFLICT(k) DO UPDATE SET quiz=excluded.quiz, act=excluded.act, calc=excluded.calc, calcTs=excluded.calcTs, updated=excluded.updated")
+        .bind(u.k, JSON.stringify(quiz), JSON.stringify(act), calc, calcTs, now).run();
     }
-    return J({ quiz, calc, calcTs, me: meOf(env, u) });
+    return J({ quiz, act, calc, calcTs, me: meOf(env, u) });
   }
 
   if (path.startsWith("admin/")) {
@@ -142,6 +163,33 @@ export async function onRequest({ request: req, env, params }) {
     if (path === "admin/users" && M === "GET") {
       const { results } = await db.prepare("SELECT u.pseudo, u.created, u.seen, u.must, d.quiz FROM users u LEFT JOIN data d ON d.k=u.k ORDER BY u.seen DESC").all();
       return J({ users: results.map(r => { const q = parse(r.quiz, {}); let n = 0; for (const v of Object.values(q)) n += v.n || 0; return { pseudo: r.pseudo, created: r.created, seen: r.seen, must: !!r.must, done: n, seenQ: Object.keys(q).length }; }) });
+    }
+    // Tableau de bord : totaux par compte, par UV, par chapitre, par jour, et questions les plus ratées.
+    if (path === "admin/stats" && M === "GET") {
+      const { results } = await db.prepare("SELECT u.pseudo, u.created, u.seen, d.quiz, d.act FROM users u LEFT JOIN data d ON d.k=u.k").all();
+      const qs = {}, ch = {};
+      const users = results.map(r => {
+        const q = parse(r.quiz, {}), A = parse(r.act, {}), uv = {}, days = {};
+        let n = 0, ok = 0;
+        for (const [id, v] of Object.entries(q)) {
+          const a = +v.n || 0, b = +v.ok || 0;
+          if (!a) continue;
+          n += a; ok += b;
+          const p = id.split("-"), U = uv[p[0]] = uv[p[0]] || [0, 0, 0];
+          U[0] += a; U[1] += b;
+          ch[p[0] + "-" + p[1]] = (ch[p[0] + "-" + p[1]] || 0) + a;
+          const Q = qs[id] = qs[id] || [0, 0];
+          Q[0] += a; Q[1] += b;
+        }
+        for (const dv of Object.values(A)) for (const [d, us] of Object.entries(dv || {})) {
+          const D = days[d] = days[d] || [0, 0, 0];
+          for (const [k, v] of Object.entries(us || {})) { D[0] += v[0]; D[1] += v[1]; D[2] += v[2]; (uv[k] = uv[k] || [0, 0, 0])[2] += v[2]; }
+        }
+        return { pseudo: r.pseudo, created: r.created, seen: r.seen, n, ok, uv, days };
+      });
+      const miss = Object.entries(qs).filter(([, v]) => v[0] >= 5).map(([id, v]) => [id, v[0], v[1]])
+        .sort((a, b) => a[2] / a[1] - b[2] / b[1] || b[1] - a[1]).slice(0, 10);
+      return J({ users, ch, miss, now });
     }
     if (path === "admin/reset" && M === "POST") {
       const t = await db.prepare("SELECT k, pseudo FROM users WHERE k=?").bind(keyOf(String(body.pseudo || ""))).first();
