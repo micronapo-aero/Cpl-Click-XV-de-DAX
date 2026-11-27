@@ -2,7 +2,9 @@
 // Cloudflare Pages Functions + D1 (liaison "DB"). Admin : variable ADMIN_PSEUDO.
 const ITER = 60000, DAY = 864e5;
 const enc = new TextEncoder();
-const J = (o, s = 200) => new Response(JSON.stringify(o), { status: s, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } });
+// CORS : le site est aussi publié ailleurs (GitHub Pages) ; il appelle alors cette API à distance.
+const CORS = { "access-control-allow-origin": "*", "access-control-allow-methods": "GET, POST, PUT, OPTIONS", "access-control-allow-headers": "content-type, authorization", "access-control-max-age": "86400" };
+const J = (o, s = 200) => new Response(JSON.stringify(o), { status: s, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...CORS } });
 const E = (msg, s = 400) => J({ error: msg }, s);
 const hex = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, "0")).join("");
 const rnd = n => hex(crypto.getRandomValues(new Uint8Array(n)));
@@ -59,6 +61,7 @@ function mergeQuiz(a, b) {
 const parse = (s, d) => { try { return s ? JSON.parse(s) : d; } catch { return d; } };
 
 export async function onRequest({ request: req, env, params }) {
+  if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
   const db = env.DB;
   if (!db) return E("Les comptes ne sont pas encore activés.", 503);
   await init(db);
